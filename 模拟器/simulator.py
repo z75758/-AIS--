@@ -9,7 +9,7 @@
 说明：
     1. 坐标系：局部平面（米），x=东，y=北；航向从正北顺时针（度）。
     2. 本船（蓝色商货船）用滑杆控制航向/航速；渔船由状态机自动生成机动轨迹。
-    3. 本船周围虚线椭圆 = 船舶领域边界；渔船为黑色，其 CRI 标签/轨迹颜色 = 碰撞危险度（绿/黄/红）。
+    3. 本船周围虚线分扇区领域（前/后/左/右非对称，随航速伸缩）；渔船为黑色，其 CRI 标签/轨迹颜色 = 碰撞危险度（绿/黄/红）。
     4. 渔船进入红区且 TCPA < t_c 时，判定"碰撞不可避免"，弹窗提示损失最小化建议。
 """
 import math
@@ -22,7 +22,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.patches import Ellipse, Polygon as MplPolygon, Rectangle, Patch
+from matplotlib.patches import Polygon as MplPolygon, Rectangle, Patch
 from matplotlib.lines import Line2D
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -37,10 +37,13 @@ CHW = 250.0              # 航道半宽（米）
 YMIN, YMAX = -1500.0, 1500.0
 
 # CRI 参数（米 / 秒）
-W_DCPA, W_TCPA, W_D = 0.4, 0.3, 0.3
+W_DCPA, W_TCPA, W_D = 0.30, 0.25, 0.15
+W_BEARING, W_VR = 0.15, 0.15           # 相对方位 / 相对速度
+W_Q = 0.30                             # 数据可信度保守系数（放大倍数 = 1 + W_Q·(1−q)）
 DCPA_D1, DCPA_D2 = 500.0, 1200.0
 TCPA_T1, TCPA_T2 = 60.0, 240.0
 D_LOW, D_HIGH = 800.0, 4000.0
+VR_LOW, VR_HIGH = 2.0, 14.0            # 相对速度（米/秒）风险阈值
 
 # 不可避免判定阈值
 DCPA_SAFE = 450.0
@@ -117,10 +120,39 @@ def _d_mu(D):
     return (D_HIGH - D) / (D_HIGH - D_LOW)
 
 
+def _bearing_mu(theta):
+    """相对方位隶属度：目标在正前方(theta=0)最危险=1，正后方(theta=±180)最不危险=0。"""
+    a = abs(theta)
+    if a >= 180.0:
+        return 0.0
+    return 0.5 + 0.5 * math.cos(math.radians(a))
+
+
+def _vr_mu(vr):
+    """相对速度隶属度：相对速度越大，反应时间越短，风险越高。"""
+    if vr <= VR_LOW:
+        return 0.0
+    if vr >= VR_HIGH:
+        return 1.0
+    return (vr - VR_LOW) / (VR_HIGH - VR_LOW)
+
+
 def compute_cri(own, target):
     dcpa, tcpa = compute_dcpa_tcpa(own, target)
     D = math.hypot(target.x - own.x, target.y - own.y)
-    return W_DCPA * _dcpa_mu(dcpa) + W_TCPA * _tcpa_mu(tcpa) + W_D * _d_mu(D)
+    # 相对方位 θ：目标相对本船航向的方位角（度，0=正前方，顺时针为正=右舷）
+    theta = angle_diff(math.degrees(math.atan2(target.x - own.x, target.y - own.y)),
+                       own.heading)
+    # 相对速度 Vᵣ（米/秒）
+    ovx, ovy = own.velocity_vec()
+    tvx, tvy = target.velocity_vec()
+    vr = math.hypot(tvx - ovx, tvy - ovy)
+    cri = (W_DCPA * _dcpa_mu(dcpa) + W_TCPA * _tcpa_mu(tcpa) + W_D * _d_mu(D)
+           + W_BEARING * _bearing_mu(theta) + W_VR * _vr_mu(vr))
+    # 数据可信度 q：可信度越低，风险评估越保守（放大 CRI，符合"提高告警保守程度"）
+    q = getattr(target, 'q', 1.0)
+    cri *= 1.0 + W_Q * (1.0 - q)
+    return min(cri, 1.0)
 
 
 def classify_zone(cri):
@@ -179,9 +211,11 @@ class Ship:
 class FishingBoat(Ship):
     STEADY, CROSS, STOP, TURN = 'steady', 'cross', 'stop', 'turn'
 
-    def __init__(self, x, y, heading, speed, length, rng):
+    def __init__(self, x, y, heading, speed, length, rng, q=1.0, ais=True):
         super().__init__(x, y, heading, speed, length)
         self.rng = rng
+        self.q = q          # 数据可信度（1=可信；无 AIS 目标偏低）
+        self.ais = ais      # 是否 AIS 可见
         self.base_speed = speed
         self.target_speed = speed
         self.state = self.STEADY
@@ -264,13 +298,40 @@ def draw_ship(ax, x, y, heading, length, color, edge='white', lw=0.7):
     ax.add_patch(MplPolygon(verts, closed=True, fc=color, ec=edge, lw=lw, zorder=6))
 
 
-def draw_domain(ax, ship):
-    """船舶领域：半透明填充 + 柔和虚线边界，不抢视线。
-    危险等级由渔船颜色（CRI）体现，避免"颜色=距离"与"颜色=危险度"两套口径打架。"""
+def domain_radii(ship):
+    """分扇区动态船舶领域四半径（前/后/左/右，米）。
+    参考 Wang 四元船舶领域：前方随航速拉长（对应制动距离），右舷 > 左舷（COLREG 让路侧留余量）。"""
     L = ship.length
-    e = Ellipse((ship.x, ship.y), 6.0 * L, 1.6 * L, angle=90.0 - ship.heading,
-                fc=OWN, alpha=0.08, ec=OWN, lw=1.0, ls=(0, (5, 5)), zorder=3)
-    ax.add_patch(e)
+    spd = ship.speed
+    R_fore = (2.5 + 0.15 * spd) * L
+    R_aft = 1.5 * L
+    R_starb = 1.2 * L
+    R_port = 0.8 * L
+    return R_fore, R_aft, R_starb, R_port
+
+
+def draw_domain(ax, ship):
+    """绘制分扇区船舶领域：前/后/左/右四段四分之一椭圆拼成的非对称闭合边界。"""
+    Rf, Ra, Rs, Rp = domain_radii(ship)
+    hdg = math.radians(ship.heading)
+    fx, fy = math.sin(hdg), math.cos(hdg)     # 船艏（前方）单位向量
+    rx, ry = math.cos(hdg), -math.sin(hdg)    # 右舷单位向量
+    x, y = ship.x, ship.y
+    pts = []
+    # 四个象限：起始方位角、该象限"前"半径、"右舷"半径
+    quads = [(0.0, Rf, Rs), (90.0, Rs, Ra), (180.0, Ra, Rp), (270.0, Rp, Rf)]
+    steps = 16
+    for a0, ea, eb in quads:
+        for i in range(steps + 1):
+            phi = math.radians(90.0 * i / steps)      # 0 ~ 90°
+            rho = 1.0 / math.sqrt((math.cos(phi) / ea) ** 2 + (math.sin(phi) / eb) ** 2 + 1e-12)
+            a = math.radians(a0) + phi
+            ca, sa = math.cos(a), math.sin(a)
+            px = x + rho * (ca * fx + sa * rx)
+            py = y + rho * (ca * fy + sa * ry)
+            pts.append((px, py))
+    ax.add_patch(MplPolygon(pts, closed=True, fc=OWN, alpha=0.06, ec=OWN,
+                            lw=1.0, ls=(0, (5, 5)), zorder=3))
 
 
 # ======================= 模块 H：主窗口 =======================
@@ -362,8 +423,8 @@ class MainWindow(QMainWindow):
         rngA = np.random.RandomState(1)
         rngB = np.random.RandomState(2)
         self.boats = [
-            FishingBoat(0.0, 300.0, 180.0, 3.0, 12.0, rngA),   # 对遇（迎面）
-            FishingBoat(120.0, -300.0, 270.0, 2.0, 10.0, rngB),  # 横穿
+            FishingBoat(0.0, 300.0, 180.0, 3.0, 12.0, rngA, q=1.0, ais=True),     # 对遇（AIS 可见）
+            FishingBoat(120.0, -300.0, 270.0, 2.0, 10.0, rngB, q=0.6, ais=False),  # 横穿（疑似无 AIS）
         ]
         self.ground_alerted = False
         self.time = 0.0
@@ -516,7 +577,8 @@ class MainWindow(QMainWindow):
             if len(trail) > 1:
                 ax.plot([p[0] for p in trail], [p[1] for p in trail], color=color, lw=1, alpha=0.4, zorder=2)
             draw_ship(ax, b.x, b.y, b.heading, b.length, FISH, edge='none')
-            ax.text(b.x, b.y + 40, f"渔船  CRI={b.cri:.2f}", ha='center', fontsize=8, color=color)
+            tag = "渔船" if b.ais else "渔船·无AIS"
+            ax.text(b.x, b.y + 40, f"{tag}  CRI={b.cri:.2f}", ha='center', fontsize=8, color=color)
             # 碰撞倒计时（与搁浅倒计时同款）：真正会逼近（DCPA 过小）时显示距碰撞秒数
             if b.dcpa is not None and b.tcpa is not None and b.dcpa < DCPA_SAFE and 0 < b.tcpa:
                 if b.tcpa < T_C:
@@ -530,7 +592,7 @@ class MainWindow(QMainWindow):
         handles = [
             Patch(facecolor=OWN, label='本船（商货船）'),
             Patch(facecolor=FISH, label='渔船'),
-            Line2D([0], [0], color=OWN, lw=1, ls=(0, (5, 5)), label='本船船舶领域'),
+            Line2D([0], [0], color=OWN, lw=1, ls=(0, (5, 5)), label='本船分扇区领域'),
             Patch(facecolor=self.ZONE_COLOR['green'], label='CRI 低风险'),
             Patch(facecolor=self.ZONE_COLOR['yellow'], label='CRI 警戒'),
             Patch(facecolor=self.ZONE_COLOR['red'], label='CRI 高警戒'),

@@ -40,13 +40,16 @@ YMIN, YMAX = -1500.0, 1500.0
 W_DCPA, W_TCPA, W_D = 0.30, 0.25, 0.15
 W_BEARING, W_VR = 0.15, 0.15           # 相对方位 / 相对速度
 W_Q = 0.30                             # 数据可信度保守系数（放大倍数 = 1 + W_Q·(1−q)）
-DCPA_D1, DCPA_D2 = 500.0, 1200.0
+# d₁ 分扇区：安全会遇距离 = 该方位领域半径 × D1_SCALE × 会遇调节；d₂ = d₁ × K_D2
+D1_SCALE = 1.5            # 领域半径 → 风险饱和距离的放大系数（1.5~2）
+K_D2 = 2.4                # d₂ / d₁ 比例（风险影响距离）
+ENC_D1 = {'head_on': 1.3, 'crossing': 1.0, 'overtaking': 0.8}   # 会遇关系对 d₁ 的调节
+ENC_CN = {'head_on': '对遇', 'crossing': '交叉', 'overtaking': '追越'}
 TCPA_T1, TCPA_T2 = 60.0, 240.0
 D_LOW, D_HIGH = 800.0, 4000.0
 VR_LOW, VR_HIGH = 2.0, 14.0            # 相对速度（米/秒）风险阈值
 
-# 不可避免判定阈值
-DCPA_SAFE = 450.0
+# 不可避免判定阈值（碰撞不可避免：预测 DCPA 侵入该方位物理领域 且 TCPA < t_c）
 T_C = 45.0
 
 # 搁浅判定阈值（距航道边界时间，秒）
@@ -63,6 +66,12 @@ FISH = '#111111'       # 渔船（黑）
 def angle_diff(a, b):
     """返回 a-b，规范到 [-180, 180)。"""
     return (a - b + 180.0) % 360.0 - 180.0
+
+
+def relative_bearing(own, target):
+    """目标相对本船的方位角（度，0=正前方，顺时针为正=右舷）。"""
+    return angle_diff(math.degrees(math.atan2(target.x - own.x, target.y - own.y)),
+                      own.heading)
 
 
 _COMPASS = [(0, "北"), (45, "东北"), (90, "东"), (135, "东南"),
@@ -94,12 +103,12 @@ def compute_dcpa_tcpa(own, target):
     return dcpa, t_cpa
 
 
-def _dcpa_mu(dcpa):
-    if dcpa <= DCPA_D1:
+def _dcpa_mu(dcpa, d1, d2):
+    if dcpa <= d1:
         return 1.0
-    if dcpa >= DCPA_D2:
+    if dcpa >= d2:
         return 0.0
-    return 0.5 - 0.5 * math.sin(math.pi / (DCPA_D2 - DCPA_D1) * (dcpa - (DCPA_D1 + DCPA_D2) / 2.0))
+    return 0.5 - 0.5 * math.sin(math.pi / (d2 - d1) * (dcpa - (d1 + d2) / 2.0))
 
 
 def _tcpa_mu(tcpa):
@@ -137,17 +146,29 @@ def _vr_mu(vr):
     return (vr - VR_LOW) / (VR_HIGH - VR_LOW)
 
 
+def classify_encounter(own, target):
+    """会遇关系分类（简化）：按两船航向差划分 对遇/交叉/追越。"""
+    dh = abs(angle_diff(target.heading, own.heading))
+    if dh < 60.0:
+        return 'overtaking'   # 航向接近 → 追越 / 被追越
+    if dh > 120.0:
+        return 'head_on'      # 航向相反 → 对遇
+    return 'crossing'         # 其余 → 交叉相遇
+
+
 def compute_cri(own, target):
     dcpa, tcpa = compute_dcpa_tcpa(own, target)
     D = math.hypot(target.x - own.x, target.y - own.y)
-    # 相对方位 θ：目标相对本船航向的方位角（度，0=正前方，顺时针为正=右舷）
-    theta = angle_diff(math.degrees(math.atan2(target.x - own.x, target.y - own.y)),
-                       own.heading)
+    theta = relative_bearing(own, target)
     # 相对速度 Vᵣ（米/秒）
     ovx, ovy = own.velocity_vec()
     tvx, tvy = target.velocity_vec()
     vr = math.hypot(tvx - ovx, tvy - ovy)
-    cri = (W_DCPA * _dcpa_mu(dcpa) + W_TCPA * _tcpa_mu(tcpa) + W_D * _d_mu(D)
+    # d₁ 分扇区：安全会遇距离随相对方位（该方位领域半径）与会遇关系变化
+    enc = classify_encounter(own, target)
+    d1 = domain_radius_at(own, theta) * D1_SCALE * ENC_D1[enc]
+    d2 = d1 * K_D2
+    cri = (W_DCPA * _dcpa_mu(dcpa, d1, d2) + W_TCPA * _tcpa_mu(tcpa) + W_D * _d_mu(D)
            + W_BEARING * _bearing_mu(theta) + W_VR * _vr_mu(vr))
     # 数据可信度 q：可信度越低，风险评估越保守（放大 CRI，符合"提高告警保守程度"）
     q = getattr(target, 'q', 1.0)
@@ -165,7 +186,8 @@ def classify_zone(cri):
 
 def is_unavoidable(own, target):
     dcpa, tcpa = compute_dcpa_tcpa(own, target)
-    return dcpa < DCPA_SAFE and 0.0 < tcpa < T_C
+    r_safe = domain_radius_at(own, relative_bearing(own, target))   # 该方位物理领域半径
+    return dcpa < r_safe and 0.0 < tcpa < T_C
 
 
 def compute_grounding_time(own):
@@ -224,6 +246,8 @@ class FishingBoat(Ship):
         self.zone = 'green'
         self.dcpa = None
         self.tcpa = None
+        self.r_safe = None      # 该方位物理领域半径（不可避免判定/倒计时用）
+        self.encounter = None   # 会遇关系（对遇/交叉/追越）
         self.alerted = False
 
     def _sample_duration(self):
@@ -310,28 +334,50 @@ def domain_radii(ship):
     return R_fore, R_aft, R_starb, R_port
 
 
-def draw_domain(ax, ship):
-    """绘制分扇区船舶领域：前/后/左/右四段四分之一椭圆拼成的非对称闭合边界。"""
+def domain_radius_at(ship, theta):
+    """本船分扇区领域在相对方位角 theta（度，0=正前方，顺时针）上的半径（米）。
+    与 draw_domain 用同一套四象限椭圆公式，保证"画出来的边界"与"算 d₁ 的半径"口径一致。"""
     Rf, Ra, Rs, Rp = domain_radii(ship)
+    a = theta % 360.0
+    if a < 90.0:
+        ea, eb, a0 = Rf, Rs, 0.0
+    elif a < 180.0:
+        ea, eb, a0 = Rs, Ra, 90.0
+    elif a < 270.0:
+        ea, eb, a0 = Ra, Rp, 180.0
+    else:
+        ea, eb, a0 = Rp, Rf, 270.0
+    phi = math.radians(a - a0)      # 0 ~ 90°
+    return 1.0 / math.sqrt((math.cos(phi) / ea) ** 2 + (math.sin(phi) / eb) ** 2 + 1e-12)
+
+
+def draw_domain(ax, ship):
+    """绘制分扇区船舶领域：前/后/左/右四段四分之一椭圆拼成的非对称闭合边界。
+    另画前/后/左/右四条分界半径，凸显各扇区半径差异（长在前、短在后）。"""
     hdg = math.radians(ship.heading)
     fx, fy = math.sin(hdg), math.cos(hdg)     # 船艏（前方）单位向量
     rx, ry = math.cos(hdg), -math.sin(hdg)    # 右舷单位向量
     x, y = ship.x, ship.y
     pts = []
-    # 四个象限：起始方位角、该象限"前"半径、"右舷"半径
-    quads = [(0.0, Rf, Rs), (90.0, Rs, Ra), (180.0, Ra, Rp), (270.0, Rp, Rf)]
-    steps = 16
-    for a0, ea, eb in quads:
-        for i in range(steps + 1):
-            phi = math.radians(90.0 * i / steps)      # 0 ~ 90°
-            rho = 1.0 / math.sqrt((math.cos(phi) / ea) ** 2 + (math.sin(phi) / eb) ** 2 + 1e-12)
-            a = math.radians(a0) + phi
-            ca, sa = math.cos(a), math.sin(a)
-            px = x + rho * (ca * fx + sa * rx)
-            py = y + rho * (ca * fy + sa * ry)
-            pts.append((px, py))
+    N = 64
+    for i in range(N):
+        a_deg = 360.0 * i / N
+        rho = domain_radius_at(ship, a_deg)
+        a = math.radians(a_deg)
+        ca, sa = math.cos(a), math.sin(a)
+        px = x + rho * (ca * fx + sa * rx)
+        py = y + rho * (ca * fy + sa * ry)
+        pts.append((px, py))
     ax.add_patch(MplPolygon(pts, closed=True, fc=OWN, alpha=0.06, ec=OWN,
                             lw=1.0, ls=(0, (5, 5)), zorder=3))
+    # 前/后/左/右四条分界半径（分扇区可视化）
+    Rf, Ra, Rs, Rp = domain_radii(ship)
+    for a_deg, R in [(0.0, Rf), (90.0, Rs), (180.0, Ra), (270.0, Rp)]:
+        a = math.radians(a_deg)
+        ca, sa = math.cos(a), math.sin(a)
+        ex = x + R * (ca * fx + sa * rx)
+        ey = y + R * (ca * fy + sa * ry)
+        ax.plot([x, ex], [y, ey], color=OWN, lw=0.6, alpha=0.35, ls=(0, (3, 3)), zorder=3)
 
 
 # ======================= 模块 H：主窗口 =======================
@@ -481,6 +527,8 @@ class MainWindow(QMainWindow):
             b.dcpa, b.tcpa = compute_dcpa_tcpa(self.own, b)
             b.cri = compute_cri(self.own, b)
             b.zone = classify_zone(b.cri)
+            b.encounter = classify_encounter(self.own, b)
+            b.r_safe = domain_radius_at(self.own, relative_bearing(self.own, b))
 
         # 航道识别：搁浅风险
         self.t_ground = compute_grounding_time(self.own)
@@ -577,10 +625,11 @@ class MainWindow(QMainWindow):
             if len(trail) > 1:
                 ax.plot([p[0] for p in trail], [p[1] for p in trail], color=color, lw=1, alpha=0.4, zorder=2)
             draw_ship(ax, b.x, b.y, b.heading, b.length, FISH, edge='none')
-            tag = "渔船" if b.ais else "渔船·无AIS"
+            enc_cn = ENC_CN.get(b.encounter, '')
+            tag = ("渔船" if b.ais else "渔船·无AIS") + (f"·{enc_cn}" if enc_cn else "")
             ax.text(b.x, b.y + 40, f"{tag}  CRI={b.cri:.2f}", ha='center', fontsize=8, color=color)
             # 碰撞倒计时（与搁浅倒计时同款）：真正会逼近（DCPA 过小）时显示距碰撞秒数
-            if b.dcpa is not None and b.tcpa is not None and b.dcpa < DCPA_SAFE and 0 < b.tcpa:
+            if b.dcpa is not None and b.tcpa is not None and b.r_safe is not None and b.dcpa < b.r_safe and 0 < b.tcpa:
                 if b.tcpa < T_C:
                     ax.text(b.x, b.y - 40, f"⚠ 距碰撞 {b.tcpa:.0f} s", ha='center',
                             fontsize=11, color='red', fontweight='bold')

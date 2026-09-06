@@ -10,7 +10,7 @@
     1. 坐标系：局部平面（米），x=东，y=北；航向从正北顺时针（度）。
     2. 本船（蓝色商货船）用滑杆控制航向/航速；渔船由状态机自动生成机动轨迹。
     3. 本船周围虚线分扇区领域（前/后/左/右非对称，随航速伸缩）；渔船为黑色，其 CRI 标签/轨迹颜色 = 碰撞危险度（绿/黄/红）。
-    4. 渔船进入红区且 TCPA < t_c 时，判定"碰撞不可避免"，弹窗提示损失最小化建议。
+    4. 安全操纵时间裕量 M = TCPA − t_c ≤ 0 时判定"紧迫危险"（非"不可避免"），弹窗提示残余风险最小化建议。
 """
 import math
 import numpy as np
@@ -49,8 +49,12 @@ TCPA_T1, TCPA_T2 = 60.0, 240.0
 D_LOW, D_HIGH = 800.0, 4000.0
 VR_LOW, VR_HIGH = 2.0, 14.0            # 相对速度（米/秒）风险阈值
 
-# 不可避免判定阈值（碰撞不可避免：预测 DCPA 侵入该方位物理领域 且 TCPA < t_c）
-T_C = 45.0
+# 最短有效操纵时间 t_c 的动态估计（项目书 3.5/3.6），原型取固定系数，后续可用粒子群/贝叶斯标定。
+# t_c = t_response + t_actuation + t_effective；M = TCPA − t_c ≤ 0 进入紧迫危险（不等同于"碰撞不可避免"）。
+T_RESPONSE = 8.0       # t_response：系统告警 + 驾驶员响应时间（秒）
+T_ACTUATION = 5.0      # t_actuation：操舵/减速指令生效延迟（秒）
+DELTA_HDG = 30.0       # 有效避让所需航向改变量（度）
+DECEL_MAX = 0.25       # 大船最大减速度（米/秒²）
 
 # 搁浅判定阈值（距航道边界时间，秒）
 T_GROUND = 30.0
@@ -156,6 +160,15 @@ def classify_encounter(own, target):
     return 'crossing'         # 其余 → 交叉相遇
 
 
+def sector_d1(own, target):
+    """d₁ 分扇区：返回 (d₁, d₂, 会遇关系)。
+    d₁ = 该方位领域半径 × D1_SCALE × 会遇调节系数；d₂ = d₁ × K_D2。"""
+    theta = relative_bearing(own, target)
+    enc = classify_encounter(own, target)
+    d1 = domain_radius_at(own, theta) * D1_SCALE * ENC_D1[enc]
+    return d1, d1 * K_D2, enc
+
+
 def compute_cri(own, target):
     dcpa, tcpa = compute_dcpa_tcpa(own, target)
     D = math.hypot(target.x - own.x, target.y - own.y)
@@ -165,9 +178,7 @@ def compute_cri(own, target):
     tvx, tvy = target.velocity_vec()
     vr = math.hypot(tvx - ovx, tvy - ovy)
     # d₁ 分扇区：安全会遇距离随相对方位（该方位领域半径）与会遇关系变化
-    enc = classify_encounter(own, target)
-    d1 = domain_radius_at(own, theta) * D1_SCALE * ENC_D1[enc]
-    d2 = d1 * K_D2
+    d1, d2, _ = sector_d1(own, target)
     cri = (W_DCPA * _dcpa_mu(dcpa, d1, d2) + W_TCPA * _tcpa_mu(tcpa) + W_D * _d_mu(D)
            + W_BEARING * _bearing_mu(theta) + W_VR * _vr_mu(vr))
     # 数据可信度 q：可信度越低，风险评估越保守（放大 CRI，符合"提高告警保守程度"）
@@ -184,10 +195,14 @@ def classify_zone(cri):
     return 'red'
 
 
-def is_unavoidable(own, target):
-    dcpa, tcpa = compute_dcpa_tcpa(own, target)
-    r_safe = domain_radius_at(own, relative_bearing(own, target))   # 该方位物理领域半径
-    return dcpa < r_safe and 0.0 < tcpa < T_C
+def estimate_tc(own):
+    """最短有效操纵时间 t_c 的动态估计（项目书 3.5/3.6，简化版）：
+    t_c = t_response + t_actuation + t_effective，
+    t_effective = max(转向时间, 减速时间)，随本船航速与操纵能力增长。"""
+    tr = own.max_turn_rate or 3.0
+    t_turn = DELTA_HDG / tr
+    t_stop = own.speed / DECEL_MAX
+    return T_RESPONSE + T_ACTUATION + max(t_turn, t_stop)
 
 
 def compute_grounding_time(own):
@@ -246,8 +261,10 @@ class FishingBoat(Ship):
         self.zone = 'green'
         self.dcpa = None
         self.tcpa = None
-        self.r_safe = None      # 该方位物理领域半径（不可避免判定/倒计时用）
+        self.margin = None      # 安全操纵时间裕量 M = TCPA − t_c（秒）
         self.encounter = None   # 会遇关系（对遇/交叉/追越）
+        self.theta = None       # 相对方位（度）
+        self.d1 = None          # 分扇区安全会遇距离（米）
         self.alerted = False
 
     def _sample_duration(self):
@@ -466,6 +483,7 @@ class MainWindow(QMainWindow):
     # ---------- 场景 ----------
     def _setup_scenario(self):
         self.own = Ship(0.0, -1000.0, 0.0, 8.0, 150.0, max_turn_rate=3.0)
+        self.tc = estimate_tc(self.own)
         rngA = np.random.RandomState(1)
         rngB = np.random.RandomState(2)
         self.boats = [
@@ -498,6 +516,7 @@ class MainWindow(QMainWindow):
             f"t = {self.time:.0f} s\n"
             f"航速 = {self.own.speed:.0f} m/s\n"
             f"航向 = {hdg:.0f}° {compass_point(hdg)}\n"
+            f"t_c = {self.tc:.0f} s\n"
             f"状态 = {risk}")
 
     # ---------- 定时器主循环 ----------
@@ -523,12 +542,15 @@ class MainWindow(QMainWindow):
 
     # ---------- 风险判定 + 弹窗 ----------
     def _check_risk(self):
+        self.tc = estimate_tc(self.own)
         for b in self.boats:
             b.dcpa, b.tcpa = compute_dcpa_tcpa(self.own, b)
             b.cri = compute_cri(self.own, b)
             b.zone = classify_zone(b.cri)
+            b.theta = relative_bearing(self.own, b)
             b.encounter = classify_encounter(self.own, b)
-            b.r_safe = domain_radius_at(self.own, relative_bearing(self.own, b))
+            b.d1, b.d2, _ = sector_d1(self.own, b)
+            b.margin = b.tcpa - self.tc   # 安全操纵时间裕量 M = TCPA − t_c
 
         # 航道识别：搁浅风险
         self.t_ground = compute_grounding_time(self.own)
@@ -542,27 +564,27 @@ class MainWindow(QMainWindow):
             return
         self.ground_alerted = False
 
-        # 碰撞告警：每艘渔船独立计数，危险解除后自动重新武装
+        # 紧迫危险告警：安全操纵时间裕量 M = TCPA − t_c ≤ 0（非"不可避免"）
         for b in self.boats:
-            if is_unavoidable(self.own, b):
+            if b.tcpa is not None and 0 < b.tcpa and b.margin is not None and b.margin <= 0:
                 if not b.alerted:
                     b.alerted = True
-                    self._trigger_unavoidable(b)
+                    self._trigger_urgent(b)
                     return
             else:
                 b.alerted = False
 
-    def _trigger_unavoidable(self, b):
+    def _trigger_urgent(self, b):
         self.running = False
         self.timer.stop()
         self.pause_btn.setText("继续")
-        QMessageBox.warning(self, "碰撞不可避免", self._loss_min_suggestion(b))
+        QMessageBox.warning(self, "紧迫危险 · 操纵余量不足", self._urgent_suggestion(b))
 
-    def _loss_min_suggestion(self, b):
+    def _urgent_suggestion(self, b):
         lines = [
-            f"检测到目标渔船与本船即将碰撞（DCPA≈{b.dcpa:.0f} m，TCPA≈{b.tcpa:.0f} s）。",
+            f"检测到目标渔船，安全操纵时间裕量不足（TCPA≈{b.tcpa:.0f} s，M=TCPA−t_c≈{b.margin:.0f} s ≤ 0）。",
             "",
-            "已无法通过正常避让避免碰撞，建议采取损失最小化操纵：",
+            "已进入紧迫危险状态，建议采取残余风险最小化操纵（降低碰撞概率、减小相对接近速度、争取反应时间）：",
             "1. 立即减速至最小操纵航速（撞击动能 E=½mv²，减速最有效）；",
             "2. 尽量以船首受撞，避免船侧破舱漏油；",
         ]
@@ -627,14 +649,15 @@ class MainWindow(QMainWindow):
             draw_ship(ax, b.x, b.y, b.heading, b.length, FISH, edge='none')
             enc_cn = ENC_CN.get(b.encounter, '')
             tag = ("渔船" if b.ais else "渔船·无AIS") + (f"·{enc_cn}" if enc_cn else "")
-            ax.text(b.x, b.y + 40, f"{tag}  CRI={b.cri:.2f}", ha='center', fontsize=8, color=color)
-            # 碰撞倒计时（与搁浅倒计时同款）：真正会逼近（DCPA 过小）时显示距碰撞秒数
-            if b.dcpa is not None and b.tcpa is not None and b.r_safe is not None and b.dcpa < b.r_safe and 0 < b.tcpa:
-                if b.tcpa < T_C:
-                    ax.text(b.x, b.y - 40, f"⚠ 距碰撞 {b.tcpa:.0f} s", ha='center',
+            d1_txt = f"  d₁={b.d1:.0f}m" if b.d1 is not None else ""
+            ax.text(b.x, b.y + 40, f"{tag}  CRI={b.cri:.2f}{d1_txt}", ha='center', fontsize=8, color=color)
+            # 紧迫程度提示：距最近会遇点时间；M=TCPA−t_c≤0 时红色警示（紧迫危险）
+            if b.tcpa is not None and 0 < b.tcpa:
+                if b.tcpa <= self.tc:
+                    ax.text(b.x, b.y - 40, f"⚠ 紧迫危险  TCPA={b.tcpa:.0f}s", ha='center',
                             fontsize=11, color='red', fontweight='bold')
                 elif b.tcpa < 120:
-                    ax.text(b.x, b.y - 40, f"距碰撞 {b.tcpa:.0f} s", ha='center',
+                    ax.text(b.x, b.y - 40, f"距最近会遇点 {b.tcpa:.0f} s", ha='center',
                             fontsize=8, color='orange')
 
         # 图例
